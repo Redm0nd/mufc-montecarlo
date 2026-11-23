@@ -144,7 +144,9 @@ resource "aws_lambda_function" "sim" {
   filename         = data.archive_file.lambda.output_path
   source_code_hash = data.archive_file.lambda.output_base64sha256
 
-  timeout     = var.timeout_seconds
+  # The AWS provider (v6.73.0 at time of writing) still validates timeout
+  # as 1-900, so create at 900 and raise it below with the CLI.
+  timeout     = 900
   memory_size = 1769 # one full vCPU - numpy here is single threaded so more won't help
 
   # Cap how many 30 minute runs can be going at once (and the bill).
@@ -157,10 +159,33 @@ resource "aws_lambda_function" "sim" {
     }
   }
 
+  lifecycle {
+    # timeout is managed by terraform_data.lambda_timeout until the provider
+    # accepts values over 900
+    ignore_changes = [timeout]
+  }
+
   depends_on = [aws_cloudwatch_log_group.lambda]
 }
 
+# Workaround for the provider's 900s validation: set the real timeout via the
+# AWS CLI. Re-runs whenever the timeout variable or function code changes.
+resource "terraform_data" "lambda_timeout" {
+  triggers_replace = [var.timeout_seconds, aws_lambda_function.sim.source_code_hash]
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      aws lambda wait function-updated-v2 --region ${var.region} --function-name ${aws_lambda_function.sim.function_name}
+      aws lambda update-function-configuration --region ${var.region} --function-name ${aws_lambda_function.sim.function_name} --timeout ${var.timeout_seconds} --query Timeout
+      aws lambda wait function-updated-v2 --region ${var.region} --function-name ${aws_lambda_function.sim.function_name}
+    EOT
+  }
+}
+
 resource "aws_lambda_event_source_mapping" "jobs" {
+  # make sure the function is at its real timeout before SQS starts invoking it
+  depends_on = [terraform_data.lambda_timeout]
+
   event_source_arn        = aws_sqs_queue.jobs.arn
   function_name           = aws_lambda_function.sim.arn
   batch_size              = 1
