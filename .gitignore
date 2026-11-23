@@ -1,0 +1,6 @@
+build/
+dist/
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/*.tfstate*
+__pycache__/
