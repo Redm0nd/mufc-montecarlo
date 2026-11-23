@@ -141,6 +141,13 @@ def run(job, context):
                 + np.bincount(ai, 3 * (ag > hg) + (hg == ag), n))
     base_gd = np.bincount(hi, hg - ag, n) + np.bincount(ai, ag - hg, n)
 
+    # Optional what-ifs, e.g. {"Man City": -50} for a points deduction
+    adjustments = job.get("points_adjustments", {})
+    for name, delta in adjustments.items():
+        if name not in idx:
+            raise ValueError(f"points_adjustments: {name!r} not found")
+        base_pts[idx[name]] += delta
+
     fx = remaining_fixtures(teams, played)
     fx_h = np.array([idx[h] for h, _ in fx])
     fx_a = np.array([idx[a] for _, a in fx])
@@ -215,6 +222,7 @@ def run(job, context):
         "simulations": total,
         "elapsed_seconds": round(time.time() - started, 1),
         "current_points": int(base_pts[idx[team]]),
+        "points_adjustments": adjustments,
         "p_title": dist[1],
         "p_top_4": sum(dist[p] for p in range(1, 5)),
         "p_top_6": sum(dist[p] for p in range(1, 7)),
