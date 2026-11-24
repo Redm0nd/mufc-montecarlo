@@ -14,7 +14,7 @@ Now, anyone who's watched United this season already knows the answer. After 11 
 
 They're not making the top 4. But I wanted an actual number on it, and while I'm at it, one on relegation too.
 
-By the end of this post you'll have:
+In this post I'll go through:
 
 - An SQS → Lambda → S3 pipeline in Terraform with a 30 minute timeout
 - The Python simulator, with no framework and only numpy
@@ -23,9 +23,9 @@ By the end of this post you'll have:
 
 All the code is on GitHub: [Redm0nd/mufc-montecarlo](https://github.com/Redm0nd/mufc-montecarlo)
 
-## What actually changed (and what didn't)
+## What changed
 
-The headline is "Lambda now runs for 30 minutes" but that's only true for **Event Functions**, the classic event-driven Lambda. Here's the breakdown from the [announcement](https://aws.amazon.com/blogs/compute/announcing-30-minute-timeout-for-on-demand-aws-lambda-event-functions/):
+The 30 minutes only applies to **Event Functions**, the classic event-driven Lambda. This is from the [announcement](https://aws.amazon.com/blogs/compute/announcing-30-minute-timeout-for-on-demand-aws-lambda-event-functions/):
 
 | Lambda type | Sync | Async | Event source mapping |
 | --- | --- | --- | --- |
@@ -33,14 +33,14 @@ The headline is "Lambda now runs for 30 minutes" but that's only true for **Even
 | Event Functions, Managed Instances | 30 min | 90 min | 90 min |
 | Web Functions | 15 min | 15 min | 15 min |
 
-A few gotchas I'd have missed if I'd only read the headline:
+There are a few things to be aware of:
 
 - **Not every event source mapping gets it.** Amazon MQ and DocumentDB mappings stay at 14 minutes. So do Kafka mappings created before November 19th, unless you recreate them or turn on provisioned mode.
-- **Init is still 10 seconds** on demand. Your handler gets 30 minutes, but your imports don't.
+- **Init is still 10 seconds** on demand, so heavy imports still need to load quickly.
 - **The caller has its own timeout.** If you invoke synchronously through something with a shorter timeout, that timeout wins. This is why I'm using SQS and not an API.
 - **It only applies to invocations that start after you change it.** An event source mapping can take a few minutes to pick it up.
 
-The Kafka one is something to be aware of. Existing mappings won't break, but they won't get the new limit either and nothing will tell you.
+I'd keep an eye on the Kafka one. Existing mappings won't break but they also won't get the new limit, and you won't get a warning about it.
 
 ## How it fits together
 
@@ -48,7 +48,7 @@ The Kafka one is something to be aware of. Existing mappings won't break, but th
 
 The setup is pretty simple. A message on the queue says which team and season to simulate, a Lambda picks it up, pulls the season's CSV, runs for 20 minutes or so and writes a JSON file to S3. Anything that fails twice ends up in the DLQ.
 
-Why SQS and not API Gateway or a function URL? Nobody wants to hold an HTTP connection open for 20 minutes. With a queue I get retries, a DLQ and back-pressure for free.
+I went with SQS rather than API Gateway or a function URL, as I didn't want to hold an HTTP connection open for 20 minutes. The queue also gives me retries and a DLQ without any extra work.
 
 ## The simulation
 
@@ -61,16 +61,16 @@ away goals ~ Poisson(attack[away] * defence[home])
 
 The ratings are fitted from this season's results. Then every remaining fixture is played out with random goals, the table gets built and I record where United finished. Do that enough times and you get a probability for every position.
 
-Two things make it a bit more realistic, and also make it slow:
+I added two things to make it a bit more realistic, which also made it slow:
 
 1. **Bootstrapping.** Eleven games in, nobody really knows how good anyone is. So rather than fitting once, I resample the played matches, refit the ratings and simulate from those. I do that 3,000 times.
-2. **The big games.** For each of United's remaining fixtures I track the odds if they win and if they lose. The gap between the two is that game's *swing*. It comes for free from the same simulations, it just needs a lot of them to settle down.
+2. **The big games.** For each of United's remaining fixtures I track the odds if they win and if they lose. The gap between the two is that game's *swing*. It uses the same simulations, but it needs a lot of them before the numbers stop jumping around.
 
 That's 3,000 fits × 10,000 seasons = **30 million simulated seasons** per request.
 
-I started with 2,000 fits, but a quick smoke test showed Lambda doing about 0.42 seconds per fit. 2,000 would have finished in around 14 minutes, under the old limit, which would've made for a pretty pointless post. At 3,000 it took 21 minutes.
+I started with 2,000 fits, but a quick smoke test showed Lambda doing about 0.42 seconds per fit. 2,000 would have finished in around 14 minutes, which is under the old limit and would've made this post a bit pointless. So I went with 3,000, which took 21 minutes.
 
-Is 30 million overkill? Probably. But the swing figures only use a third of the simulations each, and they jump around a lot below a few million. In testing, the top 4 odds moved by 8% between 50 and 100 fits on the same data, so I stuck with the bigger number.
+30 million is probably overkill, but the swing figures only use a third of the simulations each, and they jump around a lot below a few million. In testing, the top 4 odds moved by 8% between 50 and 100 fits on the same data, so I stuck with the bigger number.
 
 The core of the handler, with the full file in the repo:
 
@@ -107,7 +107,7 @@ def handler(event, context):
     return {"batchItemFailures": failures}
 ```
 
-The loop also keeps an eye on the clock. If there's less than a minute left it stops early and writes what it has. The last thing you want is the function being killed at 1,800 seconds with nothing to show for it:
+The loop also checks how much time is left. If there's less than a minute to go it stops early and writes what it has, so the function doesn't get killed at 1,800 seconds with nothing saved:
 
 ```python
 for b in range(bootstrap_fits):
@@ -120,9 +120,9 @@ for b in range(bootstrap_fits):
     ...
 ```
 
-Something I got wrong first time: some bootstrap samples leave a team with zero goals scored. That gives an attack rating of 0, numpy happily divides by it, and the whole thing falls over at `rng.poisson()` with `lam value too large`.
+Something I got wrong first time: some bootstrap samples leave a team with zero goals scored. That gives an attack rating of 0, numpy divides by it and the whole thing falls over at `rng.poisson()` with `lam value too large`.
 
-The fix was a small prior. Every team gets a couple of pretend matches against an average side, which also stops the model getting carried away with a good first month.
+To fix it I added a small prior, where every team gets a couple of pretend matches against an average side. It also stops the model overrating a team that had a good first month.
 
 I didn't need a fixtures feed either. Every team plays every other team home and away, so any pairing not in the results yet is still to come.
 
@@ -155,11 +155,11 @@ resource "aws_sqs_queue" "jobs" {
 }
 ```
 
-This is the one to watch out for. The 6x is only a recommendation. What Lambda actually enforces is that the visibility timeout is at least the function timeout, and it only checks that when the mapping is created or updated.
+This is the main thing to watch out for. AWS recommends 6x, but it's only a recommendation. What Lambda actually enforces is that the visibility timeout is at least the function timeout, and it only checks that when the mapping is created or updated.
 
 So a queue at 900 seconds was perfectly valid for a 15 minute function. Bump that function to 1800 and nothing complains, but at minute 15 the message becomes visible again and a second invocation picks up the same job.
 
-Tying both values to the one variable means they can't drift apart.
+I've tied both values to the one variable so they always change together.
 
 The function:
 
@@ -238,9 +238,9 @@ resource "terraform_data" "lambda_timeout" {
 
 The event source mapping also gets a `depends_on = [terraform_data.lambda_timeout]` so SQS doesn't start invoking the function while it's still at 15 minutes.
 
-It's not pretty, but it works, and you can delete it once the provider catches up. CloudFormation and SAM don't have this problem as they pass the value straight through to the API.
+It's a bit of a hack, but it works and you can remove it once the provider supports 1800. CloudFormation and SAM don't have this problem as they pass the value straight through to the API.
 
-A few other choices worth explaining:
+Some other settings in there:
 
 - **`memory_size = 1769`** is where Lambda gives you one full vCPU. The simulation is single threaded, so going to 4 GB would mostly just cost more.
 - **`batch_size = 1`**, because 10 jobs at 20 minutes each won't fit in any timeout.
@@ -303,9 +303,9 @@ aws logs tail /aws/lambda/mufc-montecarlo --follow
 
 ![CloudWatch log lines showing fit 3000/3000 done and a REPORT line with Duration 1278417.90 ms](https://raw.githubusercontent.com/Redm0nd/mufc-montecarlo/main/images/lambda-report-21min.png)
 
-That REPORT line is what we're after. 1,278,417 ms, just over 21 minutes in a single invocation. Before November 19th that would've died at 900,000 ms.
+The REPORT line shows 1,278,417 ms, so just over 21 minutes in a single invocation. Before November 19th that would've died at 900,000 ms.
 
-Max memory used was only 197 MB, so the 1,769 MB is really just buying the vCPU.
+Max memory used was only 197 MB, so the 1,769 MB is only there for the vCPU.
 
 Grab the result:
 
@@ -317,7 +317,7 @@ To check idempotency, send the exact same message again. You should see `already
 
 ## So, can United make the top 4?
 
-No. But at least now there's a number on it. This is straight from the Lambda run, with 109 matches played (Everton v Brentford still to come):
+No, but at least now there's a number on it. This is straight from the Lambda run, with 109 matches played (Everton v Brentford still to come):
 
 ```json
 {
@@ -344,7 +344,7 @@ No. But at least now there's a number on it. This is straight from the Lambda ru
 
 ![Bar chart of Man United's finishing position across 30 million simulated seasons, peaking at 19th, with 43.9% in the relegation places](https://raw.githubusercontent.com/Redm0nd/mufc-montecarlo/main/images/mufc-finishing-position.png)
 
-So **1 in 2,600** for the top 4. The one that actually worries me is **44% for relegation**, with 19th their single most likely finish.
+So that's **1 in 2,600** for the top 4. The more worrying number is **44% for relegation**, and 19th is their most likely finish.
 
 With the top 4 gone, the big games are really about staying up. I added relegation odds for a win, draw or loss in every remaining fixture (one more counter in the same loop, no extra simulations). These are the six-pointers:
 
@@ -358,13 +358,9 @@ With the top 4 gone, the big games are really about staying up. I added relegati
 
 ![Chart of United's relegation odds if they win, draw or lose each of their six biggest remaining games](https://raw.githubusercontent.com/Redm0nd/mufc-montecarlo/main/images/mufc-six-pointers.png)
 
-They're all against the teams around them, no surprise there. Beat Palace at home and the chance of going down drops to about a third. Lose and it's nearly two in three.
-
-That's a 30% swing (percentage points, to be precise) on one game.
+Unsurprisingly they're all against the teams around them. If they beat Palace at home the chance of going down drops to about a third, and if they lose it's nearly two in three. So around 30% (percentage points) on one game.
 
 ### Could City save United?
-
-There's one more thing hanging over the bottom of the table.
 
 In September an independent commission [found Man City guilty on 114 of the 115 charges](https://www.aljazeera.com/sports/2026/9/25/man-city-found-guilty-on-almost-all-115-premier-league-charges-report). City have appealed and the [appeal is due to be heard by January](https://www.aljazeera.com/sports/2026/10/14/manchester-city-appeal-over-charges-to-be-heard-by-january-says-regulator). No sanction has been announced yet, but [one report](https://www.football365.com/news/man-city-ffp-likely-point-deduction-three-pronged-punishment) reckons a deduction of around 50 points is likely.
 
@@ -387,19 +383,19 @@ Imagine both Manchester clubs in the Championship next season...
 
 This run was 10 million seasons in under 9 minutes. The same function handles the 21 minute job and the 9 minute one, with no chunking logic for either.
 
-Usual caveat: it's a simple model. It knows nothing about injuries, the manager or the January window, and it's judging United on 11 games of genuinely bad football. It's a fun excuse for a long running Lambda, not a betting tool. Personally, I'm hoping it's wrong.
+Usual caveat: it's a simple model. It knows nothing about injuries, the manager or the January window, and it's judging United on 11 games of genuinely bad football. Please don't use it for betting! Personally, I'm hoping it's wrong.
 
 ## Gotchas to watch out for
 
-None of these are a big deal for a function that runs for 30 seconds, but they're all worth knowing at 30 minutes.
+Most of these won't matter for a function that runs for 30 seconds, but they start to at 30 minutes.
 
-**1. Visibility timeout.** Covered above, but it's the one most likely to catch people out. Raise the function timeout later and nothing re-checks it.
+**1. Visibility timeout.** I covered this above, but I think it's the one most likely to catch people out. If you raise the function timeout later, nothing re-checks it.
 
 **2. Concurrency.** Concurrency is request rate × duration. One request a second at 30 minutes needs **1,800** concurrent executions, which is more than the usual 1,000 per region (newer accounts often start lower).
 
-Every other function in the account shares that pool, so I set `reserved_concurrent_executions` and `maximum_concurrency`. A burst of 50 messages just queues up rather than starving everything else.
+Every other function in the account shares that pool, so I set `reserved_concurrent_executions` and `maximum_concurrency`. That way a burst of 50 messages waits in the queue instead of using up all the concurrency.
 
-**3. Retries get expensive.** With `maxReceiveCount = 2`, a job that fails at minute 28 runs again before it lands in the DLQ. That's up to an hour of compute for one bad message. A typo in the team name is never going to succeed, so that's better caught up front.
+**3. Retries get expensive.** With `maxReceiveCount = 2`, a job that fails at minute 28 runs again before it lands in the DLQ. That's up to an hour of compute for one bad message. A typo in the team name will never succeed, so it's better to validate that up front.
 
 **4. Idle connections.** Not an issue here as the function isn't in a VPC. But behind a NAT gateway, idle connections get dropped after 350 seconds, so a DB connection opened at minute 1 will be dead by minute 25. Use keep-alives or reconnect.
 
@@ -407,15 +403,15 @@ Every other function in the account shares that pool, so I set `reserved_concurr
 
 **6. Duplicates.** SQS is at-least-once and a longer run is a longer window for a duplicate. That's why the handler checks S3 first and writes with `IfNoneMatch="*"`, so if two copies race only one wins.
 
-I'd usually reach for [Powertools idempotency](https://docs.powertools.aws.dev/lambda/python/latest/utilities/idempotency/) with DynamoDB, but for one output file per job S3 conditional writes do the trick with no extra table.
+I'd usually reach for [Powertools idempotency](https://docs.powertools.aws.dev/lambda/python/latest/utilities/idempotency/) with DynamoDB, but for one output file per job, S3 conditional writes are enough and I don't need an extra table.
 
 ## Cost
 
 **checks AWS bill** The 21 minute run works out at roughly 2,200 GB-seconds. At the standard [$0.0000166667 per GB-second](https://aws.amazon.com/lambda/pricing/) that's under **4 cents** a run, and arm64 is cheaper again. The free tier would cover around 180 of these a month.
 
-Could Fargate do it cheaper? Probably a touch, but then you've a cluster, a task definition, an image in ECR and something to trigger it. For a job that runs a few times a week, I know which I'd rather maintain.
+Fargate might be slightly cheaper, but then you've a cluster, a task definition, an image in ECR and something to trigger it. For a job that runs a few times a week I'd rather just have the Lambda.
 
-## When I wouldn't do this
+## When I wouldn't use this
 
 - **Anything user-facing over HTTP.** Web Functions are still 15 minutes, and nobody's waiting 20 minutes for a response anyway.
 - **Jobs that might go past 30 minutes.** Look at [durable functions](https://docs.aws.amazon.com/lambda/latest/dg/durable-functions.html) or Managed Instances (90 minutes async). I wouldn't build something that runs at 29 minutes and hope for the best.
@@ -432,10 +428,10 @@ The bucket has `force_destroy = true` so the results go with it. Download them f
 
 ## Conclusion
 
-A lot of jobs I'd have put on Fargate or Batch can now just be a Lambda function, which I'm all for.
+I'm a big fan of this change. A lot of jobs I'd have put on Fargate or Batch can now just be a Lambda function.
 
-Changing the timeout is the easy bit. The gotchas are everything around it: visibility timeouts, concurrency, retries and idempotency all matter more the longer your function runs, and AWS won't warn you about most of them. And if you're on Terraform, you'll need the workaround above for now.
+Just keep an eye on the visibility timeout, concurrency, retries and duplicates, as AWS won't warn you about most of them. And if you're using Terraform, you'll need the workaround above until the provider is updated.
 
 Next I want to try the same job as a durable function with a checkpoint every 100 fits and see if I can push it past 30 minutes. I'll look at that in a future post...
 
-PS: If you run this and your team's top-4 odds are lower than you'd like, I'm afraid the model doesn't take requests. Remember to `terraform destroy`.
+PS: Remember to `terraform destroy` when you're done!
